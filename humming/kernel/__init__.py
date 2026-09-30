@@ -1,4 +1,5 @@
 from humming.kernel.dequant_weight import DequantKernel
+from humming.kernel.demma import DemmaKernel, demma_bfp4_gemm
 from humming.kernel.humming import HummingKernel
 from humming.kernel.pack_weight import PackWeightKernel
 from humming.kernel.quant_weight import QuantWeightKernel
@@ -8,6 +9,8 @@ from humming.kernel.unpack_weight import UnpackWeightKernel
 
 __all__ = [
     "DequantKernel",
+    "DemmaKernel",
+    "demma_bfp4_gemm",
     "HummingKernel",
     "PackWeightKernel",
     "QuantWeightKernel",

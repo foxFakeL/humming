@@ -1,3 +1,4 @@
+from humming.kernel.demma import demma_bfp4_gemm
 from humming.ops.bench import tops_bench
 from humming.ops.gemm import humming_gemm
 from humming.ops.input import process_input
@@ -30,4 +31,5 @@ __all__ = [
     "humming_gemm",
     "process_mxfp4_w4a8_weight",
     "tops_bench",
+    "demma_bfp4_gemm",
 ]

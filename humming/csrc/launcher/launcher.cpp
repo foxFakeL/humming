@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "./demma_tma.h"
 #include "./elf.h"
 #include "./mapped_file.h"
 #include "./process_input.h"
@@ -343,6 +344,113 @@ std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) 
   return result;
 }
 
+std::tuple<int64_t, std::string> register_demma_kernel(const std::string &cubin_path) {
+  {
+    std::shared_lock lock(g_kernel_mutex);
+    auto it = g_path_ids.find(cubin_path);
+    if (it != g_path_ids.end()) return it->second;
+  }
+
+  auto cubin = std::make_shared<MappedFile>(cubin_path);
+  auto reader = CubinReader(cubin_path);
+  std::string kernel_name;
+  for (const auto &name : reader.getKernelNames()) {
+    if (name.find("humming_demma") == std::string::npos) continue;
+    ASSERT_CHECK(kernel_name.empty(), "multiple DEMMA kernels found in ", cubin_path);
+    kernel_name = name;
+  }
+  ASSERT_CHECK(!kernel_name.empty(), "no DEMMA kernel found in ", cubin_path);
+
+  KernelData metadata = {};
+  metadata.smem_size = reader.getUint32("SMEM_SIZE");
+  metadata.num_threads = reader.getUint32("NUM_THREADS");
+  metadata.block_shape_m = reader.getUint32("BLOCK_M");
+
+  std::unique_lock lock(g_kernel_mutex);
+  auto path_it = g_path_ids.find(cubin_path);
+  if (path_it != g_path_ids.end()) return path_it->second;
+  int64_t hash_id = manual_crc32(cubin_path);
+  hash_id = (hash_id << 30) + manual_crc32(kernel_name);
+  auto kernel_it = g_registered_kernels.find(hash_id);
+  ASSERT_CHECK(kernel_it == g_registered_kernels.end() || kernel_it->second.cubin_path == cubin_path,
+               "kernel id collision for ", cubin_path);
+  if (kernel_it == g_registered_kernels.end()) {
+    g_registered_kernels.emplace(hash_id, RegisteredKernel{cubin, cubin_path, kernel_name, metadata});
+  }
+  auto result = std::make_tuple(hash_id, kernel_name);
+  g_path_ids[cubin_path] = result;
+  return result;
+}
+
+void launch_demma(int64_t kernel_id, Tensor a, Tensor codes, Tensor by, Tensor output, int64_t block_m) {
+  ASSERT_CHECK(a.is_cuda() && codes.is_cuda() && by.is_cuda() && output.is_cuda(),
+               "DEMMA tensors must be CUDA tensors");
+  int64_t dev = a.get_device();
+  ASSERT_CHECK(codes.get_device() == dev && by.get_device() == dev && output.get_device() == dev,
+               "DEMMA tensors must share one CUDA device");
+  ASSERT_CHECK(a.is_contiguous() && codes.is_contiguous() && output.is_contiguous(),
+               "DEMMA A, codes, and output must be contiguous");
+  ASSERT_CHECK(a.scalar_type() == ScalarType::Half && output.scalar_type() == ScalarType::Half,
+               "DEMMA A and output must be float16");
+  ASSERT_CHECK(codes.scalar_type() == ScalarType::Int && by.scalar_type() == ScalarType::Byte,
+               "DEMMA codes must be int32 and Y must be uint8-backed FP8");
+  ASSERT_CHECK(a.dim() == 2 && codes.dim() == 5 && by.dim() == 4 && output.dim() == 2,
+               "invalid DEMMA tensor rank");
+  ASSERT_CHECK(by.stride(3) == 160 && by.stride(2) == 1 &&
+                   by.stride(1) == 128 * 160 && by.stride(0) == by.size(1) * 128 * 160,
+               "DEMMA Y must have physical K-major layout");
+
+  int64_t shape_m = a.size(0);
+  int64_t shape_k = a.size(1);
+  int64_t shape_n = codes.size(0) * 128;
+  ASSERT_CHECK(shape_m > 0 && shape_k > 0 && shape_n > 0 && shape_k % 1024 == 0,
+               "DEMMA requires M,N > 0 and K divisible by 1024");
+  ASSERT_CHECK(shape_m <= UINT32_MAX && shape_k <= UINT32_MAX && shape_n <= UINT32_MAX,
+               "DEMMA shape exceeds uint32_t");
+  ASSERT_CHECK(codes.size(1) == shape_k / 128 && codes.size(2) == 128 &&
+                   codes.size(3) == 5 && codes.size(4) == 4,
+               "invalid DEMMA code shape");
+  ASSERT_CHECK(by.size(0) == shape_n / 128 && by.size(1) == shape_k / 1024 &&
+                   by.size(2) == 160 && by.size(3) == 128,
+               "invalid DEMMA Y shape");
+  ASSERT_CHECK(output.size(0) == shape_m && output.size(1) == shape_n,
+               "invalid DEMMA output shape");
+  ASSERT_CHECK(block_m >= 8 && block_m <= 64 && block_m % 8 == 0,
+               "DEMMA block_m must be a multiple of 8 in [8, 64]");
+
+  DeviceContextGuard context_guard(dev);
+  CUcontext context = get_current_context();
+  auto kernel = get_or_load_kernel(kernel_id, context);
+  KernelData metadata = find_registered_kernel_data(kernel_id);
+  ASSERT_CHECK(metadata.num_threads == 384, "DEMMA kernel requires 384 threads");
+  ASSERT_CHECK(metadata.block_shape_m == block_m, "DEMMA block_m differs from compiled kernel");
+  auto shape_m_u32 = static_cast<uint32_t>(shape_m);
+  auto shape_n_u32 = static_cast<uint32_t>(shape_n);
+  auto shape_k_u32 = static_cast<uint32_t>(shape_k);
+  DemmaTmaMaps maps;
+  check_curesult(make_demma_tma_maps(&maps, codes.data_ptr(), by.data_ptr(), a.data_ptr(),
+                                     shape_m_u32, shape_n_u32, shape_k_u32,
+                                     static_cast<uint32_t>(block_m), CU_TENSOR_MAP_DATA_TYPE_FLOAT16),
+                 "make_demma_tma_maps");
+
+  void *output_ptr = output.data_ptr();
+  void *kernel_args[] = {&maps.codes, &maps.by, &maps.a, &output_ptr,
+                         &shape_m_u32, &shape_n_u32, &shape_k_u32};
+  CUlaunchConfig config = {};
+  config.gridDimX = shape_n_u32 / 128;
+  config.gridDimY = (shape_m_u32 + block_m - 1) / block_m;
+  config.gridDimZ = 1;
+  config.blockDimX = metadata.num_threads;
+  config.blockDimY = 1;
+  config.blockDimZ = 1;
+  config.sharedMemBytes = metadata.smem_size;
+  config.hStream = get_current_cuda_stream(dev);
+  check_curesult(cuFuncSetAttribute(kernel.func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                    metadata.smem_size),
+                 "cuFuncSetAttribute");
+  check_curesult(cuLaunchKernelEx(&config, kernel.func, kernel_args, nullptr), "cuLaunchKernelEx");
+}
+
 int64_t get_kernel_smem_size(int64_t kernel_id) {
   return static_cast<int64_t>(find_registered_kernel_data(kernel_id).smem_size);
 }
@@ -411,6 +519,8 @@ COMMON_TORCH_LIBRARY(humming, m) {
       "Tensor? sorted_ids, Tensor? expert_ids, Tensor? num_tokens_padded, Tensor? expert_layout, "
       "Tensor(b!) locks, SymInt top_k, SymInt valid_shape_m, bool should_check_tensor = True) -> ()");
   m.def("register_kernel(str cubin_path) -> (int, str)");
+  m.def("register_demma_kernel(str cubin_path) -> (int, str)");
+  m.def("launch_demma(int kernel_id, Tensor a, Tensor codes, Tensor by, Tensor(a!) output, int block_m) -> ()");
   m.def("register_process_input_kernel(str cubin_path) -> (int, str)");
   m.def("get_kernel_smem_size(int kernel_id) -> int");
   m.def(
@@ -424,6 +534,7 @@ COMMON_TORCH_LIBRARY(humming, m) {
 
 COMMON_TORCH_LIBRARY_IMPL(humming, CUDA, m) {
   m.impl("launch_kernel", COMMON_TORCH_BOX(&launch_kernel));
+  m.impl("launch_demma", COMMON_TORCH_BOX(&launch_demma));
   m.impl("launch_process_input", COMMON_TORCH_BOX(&launch_process_input));
   m.impl("launch_process_input.inplace", COMMON_TORCH_BOX(&launch_process_input_inplace));
   m.impl("launch_kernel.out", COMMON_TORCH_BOX(&launch_kernel_out));
@@ -431,6 +542,7 @@ COMMON_TORCH_LIBRARY_IMPL(humming, CUDA, m) {
 
 COMMON_TORCH_LIBRARY_IMPL(humming, Undefined, m) {
   m.impl("register_kernel", COMMON_TORCH_BOX(&register_kernel));
+  m.impl("register_demma_kernel", COMMON_TORCH_BOX(&register_demma_kernel));
   m.impl("register_process_input_kernel", COMMON_TORCH_BOX(&register_process_input_kernel));
   m.impl("get_kernel_smem_size", COMMON_TORCH_BOX(&get_kernel_smem_size));
 };
